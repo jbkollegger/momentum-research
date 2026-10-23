@@ -1,0 +1,212 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// The-Market-Momentum-Check · v1.1
+// Pine Script v5 (TradingView)
+// Nach der Methode aus themarket.ch «Das sind die stärksten Aktien der Welt»
+//
+// WAS ES MACHT (pro Aktie, auf die du es legst):
+//   · Momentum-Score = Durchschnitt der Kursveränderung über 6 und 12 Monate
+//     (exakt die The-Market-Rangier-Methode)
+//   · Vergleich mit dem Weltindex: «Es macht keinen Sinn, Aktien zu halten,
+//     die schwächer sind als der MSCI Welt» (Cortés)
+//   · Ausstiegsregel: Verkaufssignal, wenn der Kurs unter den gleitenden
+//     Durchschnitt fällt (10 Monate / 10 Wochen / 20 Tage, wählbar)
+//   · Bollinger-Einordnung in die 4 Kategorien des Artikels:
+//     Ausbruch / Stabiler Trend / Nachzügler / Blase
+//   · Tabelle oben rechts mit allen Werten + Alerts
+//
+// NEU IN v1.1 (Whipsaw-Glättung):
+//   · Signal-STATUS statt Tagesrauschen: Standardmässig wird die MA-Regel nur
+//     am MONATSSCHLUSS ausgewertet (so arbeitet die Original-Methode/Faber).
+//     Kreuzungen innerhalb des Monats erzeugen kein Signal mehr.
+//   · Optionale HYSTERESE: Ausstieg erst x % UNTER dem MA, Wiedereinstieg erst
+//     y % ÜBER dem MA (Default 0 = originalgetreu).
+//   · Optionale BESTÄTIGUNG: Signalwechsel erst nach n Auswertungen in Folge
+//     auf der anderen Seite (Default 1 = originalgetreu).
+//   · Hintergrund/Alerts/Screener folgen dem bestätigten STATUS.
+//     Orange Tönung = Kurs aktuell unter Schwelle, aber Monat noch nicht um
+//     («Vorwarnung», noch kein Signal). MA-Linienfarbe bleibt roh (live).
+//
+// UPDATE 09.07.2026 – ERGEBNISSE DER BACKTEST-STUDIE (Läufe A+B, siehe
+// Momentum_Backtest_Analyse_2026-07.md, Abschnitt 4):
+//   · Die Bollinger-KATEGORIE ist NUR Information, KEIN Ausschlusskriterium
+//     mehr: Der harte «Blase»-Filter kostete in beiden Läufen Rendite und
+//     erhöhte den Turnover.
+//   · Score bleibt Ø 6/12M (12-1-Variante brachte keinen Mehrwert).
+//   · Exits bleiben Monatsschluss OHNE Hysterese (Defaults so lassen);
+//     Hysterese senkte zwar den Turnover ~19 %, hätte aber 2008/09 den
+//     Drawdown von ~−46 % auf ~−57 % verschlechtert.
+//
+// EHRLICHE HINWEISE:
+//   · Glättung ist kein Free Lunch: Weniger Whipsaws = spätere echte Ausstiege
+//     im Crash. Schwellen nicht auf alten Daten «optimieren» (Overfitting!).
+//   · Monatswerte aktualisieren sich im laufenden Monat; der Status hier
+//     wertet deshalb bewusst nur abgeschlossene Monatskerzen aus (kein Repaint).
+//   · Monatsschluss-Auswertung ist auf Tages-Chart gedacht; auf Wochen-Chart
+//     kann der Monatswechsel um wenige Tage verschoben erfasst werden.
+//   · Aktie und Benchmark können in verschiedenen Währungen notieren; das
+//     verzerrt den Vergleich leicht (CHF-Aktie vs. USD-Index).
+//   · Momentum ist akademisch gut belegt, hat aber bekannte Crash-Phasen
+//     (scharfe Markterholungen). Positionsgrössen entsprechend wählen.
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=5
+indicator("The-Market-Momentum-Check", "TM-Momentum", overlay=true)
+
+// ── Einstellungen ────────────────────────────────────────────────────────────
+gB = "Regeln"
+benchSym  = input.symbol("AMEX:URTH", "Benchmark (MSCI-World-ETF)", group=gB)
+maMode    = input.string("10 Monate", "Ausstiegs-MA (Cortés)", options=["10 Monate", "10 Wochen", "20 Tage"], group=gB)
+nachzPct  = input.float(75, "Nachzügler: notiert unter x % des 5-Jahres-Hochs", minval=10, maxval=100, group=gB)
+blaseRank = input.int(85, "Blase: BB-Bandbreite über Perzentil (36 Monate)", minval=50, maxval=99, group=gB)
+tightRank = input.int(25, "Ausbruch: vorherige Enge unter Perzentil", minval=1, maxval=50, group=gB)
+showBB    = input.bool(true, "Monats-Bollinger-Bänder (20, 2σ) anzeigen", group=gB)
+
+gS = "Signal-Glättung (Whipsaw-Schutz)"
+evalMode = input.string("Nur Monatsschluss", "Auswertung der MA-Regel", options=["Nur Monatsschluss", "Jeder Schluss (wie v1.0)"], group=gS,
+     tooltip="Original-Methode: Signal zählt nur am Monatsende. «Jeder Schluss» = altes Verhalten (jede Tageskerze).")
+hystOut  = input.float(0.0, "Hysterese Ausstieg: erst x % UNTER dem MA", minval=0, maxval=15, step=0.5, group=gS,
+     tooltip="0 = originalgetreu. Beispiel 2: Verkaufssignal erst, wenn der Auswertungs-Schluss 2 % unter dem MA liegt.")
+hystIn   = input.float(0.0, "Hysterese Einstieg: erst x % ÜBER dem MA", minval=0, maxval=15, step=0.5, group=gS,
+     tooltip="0 = originalgetreu. Verhindert sofortiges Rein/Raus direkt an der Linie.")
+confirmN = input.int(1, "Bestätigung: n Auswertungen in Folge", minval=1, maxval=6, group=gS,
+     tooltip="1 = originalgetreu. 2 = erst nach zwei Monatsschlüssen (bzw. Kerzen) auf der anderen Seite wechseln.")
+
+// ── Monatsdaten der Aktie ────────────────────────────────────────────────────
+f_m() =>
+    float basis = ta.sma(close, 20)
+    float dev   = 2.0 * ta.stdev(close, 20)
+    float upper = basis + dev
+    float lower = basis - dev
+    float bw    = basis != 0 ? (upper - lower) / basis * 100 : na
+    float bwRk  = ta.percentrank(bw, 36)
+    bool  prT   = bwRk < tightRank
+    bool  tight = prT[1] or prT[2] or prT[3]
+    float ma10  = ta.sma(close, 10)
+    float mom6  = close[6] != 0 ? (close / close[6] - 1) * 100 : na
+    float mom12 = close[12] != 0 ? (close / close[12] - 1) * 100 : na
+    float hi5y  = ta.highest(close, 60)
+    [mom6, mom12, ma10, basis, upper, lower, bw, bwRk, tight, hi5y, close]
+
+f_mom() =>
+    float mom6  = close[6] != 0 ? (close / close[6] - 1) * 100 : na
+    float mom12 = close[12] != 0 ? (close / close[12] - 1) * 100 : na
+    [mom6, mom12]
+
+[m6, m12, ma10M, basisM, upperM, lowerM, bwM, bwRankM, tightM, hi5yM, closeM] = request.security(syminfo.tickerid, "M", f_m())
+[b6, b12] = request.security(benchSym, "M", f_mom())
+ma10W = request.security(syminfo.tickerid, "W", ta.sma(close, 10))
+ma20D = request.security(syminfo.tickerid, "D", ta.sma(close, 20))
+
+// ── Auswertung ───────────────────────────────────────────────────────────────
+score    = (m6 + m12) / 2
+bscore   = (b6 + b12) / 2
+stronger = score > bscore
+
+maSel   = maMode == "10 Monate" ? ma10M : maMode == "10 Wochen" ? ma10W : ma20D
+aboveMA = close > maSel                                  // roh, live (wie v1.0)
+
+// ── Signal-Statusmaschine (v1.1) ─────────────────────────────────────────────
+// Auswertungszeitpunkt: Monatswechsel-Kerze nutzt die Werte der VORHERIGEN
+// Kerze (= letzter Schluss des abgelaufenen Monats) → kein Repaint.
+bool monthTurn = nz(ta.change(time("M")), 0) != 0
+bool monthlyEv = evalMode == "Nur Monatsschluss"
+bool evalBar   = monthlyEv ? monthTurn : barstate.isconfirmed
+
+float eClose = monthlyEv ? close[1] : close
+float eMA    = monthlyEv ? maSel[1] : maSel
+float eExit  = eMA * (1 - hystOut / 100)                 // Ausstiegsschwelle
+float eEntry = eMA * (1 + hystIn / 100)                  // Einstiegsschwelle
+
+var bool held    = true
+var bool initDon = false
+var int  cntOut  = 0
+var int  cntIn   = 0
+bool sellNow = false
+bool buyNow  = false
+
+if not initDon and not na(maSel)
+    held    := close > maSel
+    initDon := true
+
+if initDon and evalBar and not na(eMA)
+    if held
+        cntOut := eClose < eExit ? cntOut + 1 : 0
+        cntIn  := 0
+        if cntOut >= confirmN
+            held    := false
+            sellNow := true
+            cntOut  := 0
+    else
+        cntIn  := eClose > eEntry ? cntIn + 1 : 0
+        cntOut := 0
+        if cntIn >= confirmN
+            held   := true
+            buyNow := true
+            cntIn  := 0
+
+// Vorwarnung: Kurs aktuell unter Ausstiegsschwelle, Status aber (noch) HALTEN
+bool preWarn = held and not na(maSel) and close < maSel * (1 - hystOut / 100)
+
+string cat = "—"
+if not na(score) and not na(bscore)
+    if tightM and closeM > upperM
+        cat := "Ausbruch"
+    else if not na(bwRankM) and bwRankM >= blaseRank and closeM > basisM
+        cat := "Blase (Vorsicht)"
+    else if stronger and closeM < hi5yM * nachzPct / 100
+        cat := "Nachzügler"
+    else if stronger and closeM > basisM
+        cat := "Stabiler Trend"
+    else
+        cat := "Schwach"
+
+color catCol = cat == "Ausbruch" ? color.green : cat == "Stabiler Trend" ? color.teal :
+     cat == "Nachzügler" ? color.blue : cat == "Blase (Vorsicht)" ? color.orange :
+     cat == "Schwach" ? color.red : color.gray
+
+// ── Darstellung ──────────────────────────────────────────────────────────────
+plot(maSel, "Ausstiegs-MA", color=aboveMA ? color.teal : color.red, linewidth=2)
+plot(hystOut > 0 ? maSel * (1 - hystOut / 100) : na, "Ausstiegsschwelle (Hysterese)", color=color.new(color.red, 55), style=plot.style_linebr)
+plot(hystIn > 0 ? maSel * (1 + hystIn / 100) : na, "Einstiegsschwelle (Hysterese)", color=color.new(color.green, 65), style=plot.style_linebr)
+pU = plot(showBB ? upperM : na, "BB oben (M)", color=color.new(color.gray, 55))
+pL = plot(showBB ? lowerM : na, "BB unten (M)", color=color.new(color.gray, 55))
+fill(pU, pL, color=color.new(color.gray, 93))
+// Rot = bestätigtes Verkaufssignal aktiv · Orange = Vorwarnung (Monat läuft noch)
+bgcolor(not held ? color.new(color.red, 90) : preWarn ? color.new(color.orange, 94) : na)
+
+f_pct(float x) =>
+    na(x) ? "—" : str.tostring(x, "#.#") + "%"
+
+var table t = table.new(position.top_right, 2, 9, bgcolor=color.new(color.black, 25), border_width=1, border_color=color.new(color.gray, 70))
+if barstate.islast
+    table.cell(t, 0, 0, "Momentum 6M",  text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 0, f_pct(m6),      text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 1, "Momentum 12M", text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 1, f_pct(m12),     text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 2, "Score (Ø 6/12M)", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 2, f_pct(score),   text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 3, "Benchmark-Score", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 3, f_pct(bscore),  text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 4, "Stärker als Index?", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 4, na(score) or na(bscore) ? "—" : stronger ? "JA" : "NEIN", text_color=stronger ? color.green : color.red, text_size=size.small)
+    table.cell(t, 0, 5, "Kurs vs. " + maMode + " (roh)", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 5, na(maSel) ? "—" : aboveMA ? "darüber" : "darunter", text_color=aboveMA ? color.green : color.red, text_size=size.small)
+    table.cell(t, 0, 6, "Signal (" + (monthlyEv ? "Monatsschluss" : "jeder Schluss") + ")", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 6, held ? (preWarn ? "HALTEN · Vorwarnung" : "HALTEN") : "VERKAUFSSIGNAL", text_color=held ? (preWarn ? color.orange : color.green) : color.red, text_size=size.small)
+    table.cell(t, 0, 7, "BB-Breite (M)", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 7, na(bwM) ? "—" : str.tostring(bwM, "#.#") + "%  (P" + (na(bwRankM) ? "—" : str.tostring(bwRankM, "#")) + ")", text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 8, "Kategorie (Info)", text_color=color.gray, text_size=size.small)
+    table.cell(t, 1, 8, cat, text_color=catCol, text_size=size.small)
+
+// ── Screener-Ausgaben (für TradingView Pine Screener) ────────────────────────
+plot(score, "Momentum-Score %", display=display.data_window)
+plot(bscore, "Benchmark-Score %", display=display.data_window)
+plot(na(score) or na(bscore) ? na : stronger ? 1 : 0, "Stärker als Benchmark (1/0)", display=display.data_window)
+plot(na(maSel) ? na : aboveMA ? 1 : 0, "Über Ausstiegs-MA roh (1/0)", display=display.data_window)
+plot(initDon ? (held ? 1 : 0) : na, "Signal-Status bestätigt (1/0)", display=display.data_window)
+plot(cat == "Ausbruch" ? 4 : cat == "Stabiler Trend" ? 3 : cat == "Nachzügler" ? 2 : cat == "Blase (Vorsicht)" ? 1 : cat == "Schwach" ? 0 : na, "Kategorie-Code (4=Ausbruch…0=Schwach)", display=display.data_window)
+
+// ── Alerts ───────────────────────────────────────────────────────────────────
+alertcondition(sellNow, "Verkaufssignal bestätigt", "Ausstiegs-MA-Regel ausgelöst (nach Auswertungsmodus/Hysterese/Bestätigung)")
+alertcondition(buyNow, "Wiedereinstieg bestätigt", "Kurs wieder regelkonform über dem Ausstiegs-MA")
+alertcondition(ta.crossunder(score, bscore), "Momentum unter Benchmark", "Momentum-Score fällt unter den Benchmark-Score")

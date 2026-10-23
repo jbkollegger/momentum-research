@@ -1,0 +1,15 @@
+# price caches and local outputs
+cache*.pkl
+*.pkl
+backtest_ergebnisse.csv
+equity_monatsrenditen.csv
+screen_*.csv
+# personal holdings — never commit
+meine_titel.txt
+holdings*.txt
+# python / os
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.env
